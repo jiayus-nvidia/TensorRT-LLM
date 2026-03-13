@@ -465,6 +465,7 @@ class KVCacheManager(BaseResourceManager):
                 }
 
         # Validate and adjust attention windows against their upper bounds if needed
+        max_output_len = kv_cache_config.max_output_len if hasattr(kv_cache_config, 'max_output_len') else None
         blocks_per_window, self.max_seq_len, self.max_attention_window_vec = self._validate_and_adjust_attention_windows(
             max_attention_window_vec=self.max_attention_window_vec,
             blocks_per_window=blocks_per_window,
@@ -472,6 +473,7 @@ class KVCacheManager(BaseResourceManager):
             sink_token_length=sink_token_length,
             max_seq_len=self.max_seq_len,
             max_beam_width=max_beam_width,
+            max_output_len=max_output_len,
         )
 
         if kv_cache_type != CacheTypeCpp.SELF:
@@ -926,10 +928,35 @@ class KVCacheManager(BaseResourceManager):
     def get_max_atten_window_upper_bound(self, blocks_in_primary_pool,
                                          tokens_per_block, max_beam_width,
                                          sink_token_len,
-                                         max_seq_len: Optional[int]):
-        token_capacity = blocks_in_primary_pool * tokens_per_block
-        max_blocks_per_seq = math.floor(token_capacity /
-                                        (max_beam_width * tokens_per_block))
+                                         max_seq_len: Optional[int],
+                                         max_output_len: Optional[int] = None):
+        block_capacity = blocks_in_primary_pool
+
+        if max_beam_width > 1 and max_output_len is not None:
+            # Port of C++ KVCacheManager::calculateMaxAttentionWindow.
+            # Context blocks are shared across beams; only output blocks
+            # (the last context block that gets written to + generation
+            # blocks) are allocated per-beam.
+            output_blocks_per_beam = math.ceil(max_output_len / tokens_per_block)
+            # +1 for the last context block which must be per-beam
+            output_blocks_per_beam += 1
+            output_block_requirements = output_blocks_per_beam * max_beam_width
+            if output_block_requirements > block_capacity:
+                # Can't even fit output, fall back to conservative estimate
+                max_blocks_per_seq = math.floor(
+                    block_capacity / max_beam_width)
+            else:
+                leftover_blocks = block_capacity - output_block_requirements
+                # Leftover blocks are shared context blocks (1 block per beam-group)
+                max_atten_window = max_output_len + leftover_blocks * tokens_per_block
+                if max_seq_len is not None:
+                    max_atten_window = min(max_atten_window, max_seq_len)
+                assert max_atten_window > 0, "Impossible to fit in any sequence in kvCache"
+                return max_atten_window
+        else:
+            max_blocks_per_seq = math.floor(
+                block_capacity / (max_beam_width if max_beam_width > 1 else 1))
+
         assert max_blocks_per_seq > 0, "Impossible to fit in any sequence in kvCache"
 
         max_token_num = max_blocks_per_seq * tokens_per_block
@@ -1410,6 +1437,7 @@ class KVCacheManager(BaseResourceManager):
         sink_token_length: int,
         max_seq_len: int,
         max_beam_width: int,
+        max_output_len: Optional[int] = None,
     ) -> Tuple[BlocksPerWindow, int, List[int]]:
         """
         Validate and adjust attention windows against their upper bounds if needed.
@@ -1421,6 +1449,7 @@ class KVCacheManager(BaseResourceManager):
             tokens_per_block: Number of tokens per block
             sink_token_length: Length of sink tokens
             max_seq_len: Maximum sequence length
+            max_output_len: Maximum output length per request (for beam search sharing optimization)
 
         Returns:
             Tuple of (adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_max_attention_window_vec)
@@ -1434,7 +1463,8 @@ class KVCacheManager(BaseResourceManager):
                 tokens_per_block=tokens_per_block,
                 max_beam_width=max_beam_width,
                 sink_token_len=sink_token_length,
-                max_seq_len=max_seq_len)
+                max_seq_len=max_seq_len,
+                max_output_len=max_output_len)
             if window_size > upper_bound:
                 logger.warning(
                     f"Attention window size {window_size} exceeds upper bound {upper_bound} "

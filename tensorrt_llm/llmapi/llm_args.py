@@ -2089,6 +2089,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    max_output_len: Optional[int] = Field(
+        default=None,
+        description=
+        "Maximum output (generation) length per request. When set with beam search "
+        "(beam_width > 1), the KV cache pool sizing accounts for context blocks "
+        "being shared across beams, significantly reducing memory requirements. "
+        "If None, falls back to the conservative estimate (all blocks per-beam)."
+    )
+
     use_kv_cache_manager_v2: bool = Field(
         default=False,
         status="prototype",
