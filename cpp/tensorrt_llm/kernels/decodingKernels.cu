@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 
+#include <algorithm>
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
@@ -316,7 +317,7 @@ void invokeGatherTree(gatherTreeParam param)
     }
 }
 
-__global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
+__global__ void insertUnfinishedPathKernelBackup(BeamHypotheses bh)
 {
     // Move ALL unfinished beams from bh.outputIdsUnfinish to bh.outputIdsCBA
     // So here might be more than `nBM` beams in bh.outputIdsCBA after this kernel
@@ -381,9 +382,88 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
     }
 }
 
+// ===================== Optimized kernel (V2) =====================
+// Two optimizations over the original:
+//   1) Per-beam parallelism: each thread handles one beam (threadIdx.x == beam index)
+//      -> eliminates serial BM loop, all beams run concurrently
+//   2) Merged logprobs loop: the two pointer-chasing passes (outputIds + logProbs)
+//      traverse the identical prevId chain, so merge into a single loop
+//      -> halves redundant memory reads when logprobs is ON
+__global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
+{
+    size_t const bid = blockIdx.x;       // Index of Batch
+    size_t const nBM{bh.nBeamWidth};
+    size_t const nMBS{bh.nMaxBatchSize}; // Only for bh.logProbsTiled
+    size_t const nMSL{bh.nMaxSeqLen};
+
+    if (bh.batchDones[bid])
+    {
+        return;
+    }
+
+    bool const bOutputLogProbs{bh.logProbsCBA != nullptr && bh.logProbsTiled != nullptr};
+
+    // Load indexDstStart into shared memory so all threads read it
+    // before thread 0 updates numBeamsCBA at the end.
+    __shared__ int s_indexDstStart;
+    if (threadIdx.x == 0)
+    {
+        s_indexDstStart = bh.numBeamsCBA[bid];
+    }
+    __syncthreads();
+    int const indexDstStart = s_indexDstStart;
+
+    // Each thread handles one or more beams (grid-stride loop for BM > 1024 safety)
+    for (size_t i = threadIdx.x; i < nBM; i += blockDim.x)
+    {
+        int const srcBeam = bid * nBM + i;
+        int const dstBeam = bid * nBM * 2 + i + indexDstStart;
+        int const step = bh.sequenceLengths[srcBeam] - 1;
+
+        // The last token
+        int const srcId = srcBeam * nMSL + step;
+        int const dstId = dstBeam * nMSL + step;
+        bh.outputIdsCBA[dstId] = bh.outputIdsUnfinish[srcId];
+        if (bOutputLogProbs)
+        {
+            bh.logProbsCBA[dstId] = bh.logProbsTiled[step * nMBS * nBM + srcBeam];
+        }
+
+        // Merged single-pass: reconstruct path for outputIds AND logProbs.
+        // The two separate loops in the original kernel traverse the identical
+        // prevId chain, so we merge them to avoid redundant pointer-chasing reads.
+        int prevId = bh.parentIdsUnfinish[srcId];
+        for (int j = step - 1; j >= 0; --j)
+        {
+            int const index = bid * nBM * nMSL + prevId * nMSL + j;
+            bh.outputIdsCBA[dstBeam * nMSL + j] = bh.outputIdsUnfinish[index];
+            if (bOutputLogProbs)
+            {
+                bh.logProbsCBA[dstBeam * nMSL + j] = bh.logProbsTiled[j * nMBS * nBM + bid * nBM + prevId];
+            }
+            prevId = bh.parentIdsUnfinish[index];
+        }
+
+        // Other parameters
+        bh.sequenceLengthsCBA[dstBeam] = bh.sequenceLengths[srcBeam];
+        bh.normedScoresCBA[dstBeam]
+            = applyLengthPenalty(bh.cumLogProbs[srcBeam], step - bh.inputLengths[srcBeam] + 1, bh.lengthPenalties[bid]);
+        bh.cumLogProbsCBA[dstBeam] = bh.cumLogProbs[srcBeam];
+    }
+
+    // Only thread 0 updates the beam count (after all threads finished)
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        bh.numBeamsCBA[bid] = indexDstStart + static_cast<int>(nBM);
+    }
+}
+
 void invokeInsertUnfinishedPath(BeamHypotheses& bh, cudaStream_t stream)
 {
-    insertUnfinishedPathKernel<<<bh.nBatchSize, 1, 0, stream>>>(bh);
+    // insertUnfinishedPathKernel<<<bh.nBatchSize, 1, 0, stream>>>(bh);
+    int const tpb = std::min(static_cast<int>(bh.nBeamWidth), 1024);
+    insertUnfinishedPathKernel<<<bh.nBatchSize, tpb, 0, stream>>>(bh);
 }
 
 __global__ void finalizeKernel(BeamHypotheses bh)
